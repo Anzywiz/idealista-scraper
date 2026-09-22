@@ -40,11 +40,12 @@ from __future__ import annotations
 import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from session_manager import CloudflareSession, close_all_browsers
+from session_manager import CloudflareSession, close_all_browsers, prime
 from utils import (
     load_config, log_head, log_info, log_ok, log_warn, log_err, log_step,
     parse_pt_number, jitter_sleep,
@@ -117,6 +118,74 @@ def parse_parish_list(html: str, root_url: str) -> list[dict]:
 
 # ───────────────────────── crawl logic ─────────────────────────
 
+INDEX_PAGE_MARKER = "concelhos-freguesias"
+
+
+def _is_index_link(url: str) -> bool:
+    """True if this href is itself another drill-down index page (lists
+    more sub-locations) rather than a genuine, paginate-able listing page.
+    Some concelhos are broken straight into freguesia-level leaf links on
+    a district's concelhos-freguesias page, but others point to their OWN
+    '.../<concelho>/concelhos-freguesias' page instead — scraping those
+    directly and appending '/pagina-N' produces a URL that doesn't exist."""
+    return INDEX_PAGE_MARKER in url
+
+
+def resolve_leaf_links(session: CloudflareSession, cfg: dict, root_url: str,
+                        url: str, count: int, region_name: str, district_name: str,
+                        max_depth: int = 4) -> list[dict]:
+    """Iteratively drill an index page (and any further index pages it
+    points to) down to genuine leaf listing links. Handles arbitrary
+    nesting depth instead of assuming district -> parish is always exactly
+    one hop."""
+    leaves: list[dict] = []
+    stack: list[tuple[str, int, Optional[str]]] = [(url, count, None)]
+    depth_map = {url: 0}
+
+    while stack:
+        cur_url, cur_count, concelho_name = stack.pop()
+        depth = depth_map.get(cur_url, 0)
+        if depth > max_depth:
+            log_warn(f"Max drill depth ({max_depth}) reached at {cur_url} — using it as-is; "
+                     f"pagination may not work if this is still an index page.")
+            leaves.append({
+                "url": cur_url, "count": cur_count, "granularity": "unresolved",
+                "region": region_name, "district": district_name,
+                "parish": concelho_name or district_name,
+            })
+            continue
+
+        html = session.get_html(cur_url)
+        jitter_sleep(cfg.get("phase1_delay_seconds", [1.0, 2.0]))
+        if not html:
+            log_warn(f"Failed to fetch index page: {cur_url}")
+            continue
+
+        entries = parse_parish_list(html, root_url)
+        if not entries:
+            # Nothing further to break down — this page IS the leaf.
+            leaves.append({
+                "url": cur_url, "count": cur_count, "granularity": "parish",
+                "region": region_name, "district": district_name,
+                "parish": concelho_name or district_name,
+            })
+            continue
+
+        for e in entries:
+            if _is_index_link(e["url"]):
+                stack.append((e["url"], e["count"], e["name"]))
+                depth_map[e["url"]] = depth + 1
+            else:
+                leaves.append({
+                    "url": e["url"], "count": e["count"], "granularity": "parish",
+                    "region": region_name, "district": district_name, "parish": e["name"],
+                })
+
+    return leaves
+
+
+# ───────────────────────── crawl logic ─────────────────────────
+
 def build_links_for_category(session: CloudflareSession, cfg: dict, root_url: str,
                               category_url: str, cap: int) -> list[dict]:
     html = session.get_html(category_url)
@@ -146,44 +215,37 @@ def build_links_for_category(session: CloudflareSession, cfg: dict, root_url: st
             for d in region["districts"]:
                 drill_jobs.append((region["region"], d))
 
-    if not drill_jobs:
-        return results
+    if drill_jobs:
+        log_info(f"{len(drill_jobs)} district(s) exceed the {cap}-listing cap — "
+                  f"drilling into concelhos-freguesias pages…")
 
-    log_info(f"{len(drill_jobs)} district(s) exceed the {cap}-listing cap — "
-              f"drilling into concelhos-freguesias pages…")
+        def _drill(job):
+            region_name, district = job
+            return resolve_leaf_links(session, cfg, root_url, district["url"], district["count"],
+                                       region_name, district["name"])
 
-    def _drill(job):
-        region_name, district = job
-        d_html = session.get_html(district["url"])
-        jitter_sleep(cfg.get("phase1_delay_seconds", [1.0, 2.0]))
-        if not d_html:
-            log_warn(f"Failed to fetch district page for {district['name']} ({district['url']})")
-            return []
-        parishes = parse_parish_list(d_html, root_url)
-        if not parishes:
-            log_warn(f"No parish links parsed for {district['name']} — falling back to district link")
-            return [{
-                "url": district["url"], "count": district["count"],
-                "granularity": "district", "region": region_name, "district": district["name"],
-            }]
-        out = []
-        for p in parishes:
-            out.append({
-                "url": p["url"], "count": p["count"], "granularity": "parish",
-                "region": region_name, "district": district["name"], "parish": p["name"],
-            })
-        return out
+        workers = cfg.get("phase1_concurrency", 4)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_drill, job) for job in drill_jobs]
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                log_step(done, len(drill_jobs), "district pages drilled")
+                results.extend(fut.result() or [])
 
-    workers = cfg.get("phase1_concurrency", 4)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_drill, job) for job in drill_jobs]
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            log_step(done, len(drill_jobs), "district pages drilled")
-            results.extend(fut.result() or [])
+    # De-dupe by URL (defensive — recursive drilling shouldn't normally
+    # revisit the same leaf, but this guards against overlapping entries).
+    seen_urls = set()
+    deduped = []
+    for r in results:
+        if r["url"] in seen_urls:
+            continue
+        seen_urls.add(r["url"])
+        deduped.append(r)
+    if len(deduped) != len(results):
+        log_warn(f"Removed {len(results) - len(deduped)} duplicate URL(s) within this category")
 
-    return results
+    return deduped
 
 
 def run(cfg: dict, only_section: str | None = None, only_category: str | None = None) -> dict:
@@ -191,8 +253,13 @@ def run(cfg: dict, only_section: str | None = None, only_category: str | None = 
     base_url = cfg["base_url"]
     cap = cfg.get("max_listing_cap", 1800)
 
+    prime(cfg)  # registers SIGINT/SIGTERM cleanup from the main thread
     session = CloudflareSession(cfg)
     all_links: dict[str, dict[str, list[dict]]] = {}
+    # Some categories resolve to the exact same URL across sections (e.g.
+    # "trespasse" has no separate buy/rent path on the site) — cache by
+    # URL so it's only fetched/drilled once instead of twice.
+    category_url_cache: dict[str, list[dict]] = {}
 
     try:
         for section in cfg["sections"]:
@@ -207,9 +274,16 @@ def run(cfg: dict, only_section: str | None = None, only_category: str | None = 
                     continue
 
                 category_url = f"{base_url}/{cat['path']}/"
-                log_head(f"{skey} / {ckey} — {category_url}")
 
-                links = build_links_for_category(session, cfg, root_url, category_url, cap)
+                if category_url in category_url_cache:
+                    log_info(f"{skey}/{ckey}: same path as an already-fetched category "
+                              f"({category_url}) — reusing its links instead of re-fetching")
+                    links = category_url_cache[category_url]
+                else:
+                    log_head(f"{skey} / {ckey} — {category_url}")
+                    links = build_links_for_category(session, cfg, root_url, category_url, cap)
+                    category_url_cache[category_url] = links
+
                 all_links[skey][ckey] = links
                 log_ok(f"{skey}/{ckey}: {len(links)} scrape-ready links "
                        f"({sum(l['count'] for l in links)} listings)")
@@ -219,7 +293,25 @@ def run(cfg: dict, only_section: str | None = None, only_category: str | None = 
         session.close()
         close_all_browsers()
 
+    _report_cross_category_overlap(all_links)
     return all_links
+
+
+def _report_cross_category_overlap(all_links: dict) -> None:
+    """Log which (section, category) pairs ended up sharing identical URLs
+    — expected for e.g. trespasse (same path under comprar and arrendar),
+    but worth surfacing so it's never a silent surprise."""
+    owners: dict[str, list[str]] = {}
+    for skey, cats in all_links.items():
+        for ckey, links in cats.items():
+            for link in links:
+                owners.setdefault(link["url"], []).append(f"{skey}/{ckey}")
+
+    shared = {url: keys for url, keys in owners.items() if len(set(keys)) > 1}
+    if shared:
+        pairs = sorted({tuple(sorted(set(keys))) for keys in shared.values()})
+        log_warn(f"{len(shared)} URL(s) are shared across more than one (section, category) — "
+                 f"combinations: {pairs}")
 
 
 def main():
