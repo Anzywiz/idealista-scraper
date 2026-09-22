@@ -22,6 +22,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -168,11 +169,11 @@ def parse_price_block(soup: BeautifulSoup):
     return None
 
 
-def parse_agent(soup: BeautifulSoup) -> dict:
+def parse_agent(soup: BeautifulSoup, base_url: str) -> dict:
     out = {"agent_id": "", "agent_url": ""}
     a = soup.select_one(".advertiser-name-container a.about-advertiser-name")
     if a:
-        out["agent_url"] = a.get("href", "")
+        out["agent_url"] = urljoin(base_url, a.get("href", ""))
         # spans right after the name often hold the AMI licence number,
         # which is a more useful agent identifier than a URL slug
         container = a.find_parent(class_="advertiser-name-container")
@@ -200,13 +201,13 @@ def parse_property_type_title(soup: BeautifulSoup) -> str:
     return m.group(1).strip() if m else ""
 
 
-def parse_detail_page(html: str) -> dict:
+def parse_detail_page(html: str, base_url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     feats = parse_specific_features(soup)
     equipment = parse_equipment(soup)
     location = parse_location(soup)
-    agent = parse_agent(soup)
+    agent = parse_agent(soup, base_url)
 
     amenities = feats["amenities"] + equipment
     property_type = feats["raw_property_type"] or parse_property_type_title(soup)
@@ -277,7 +278,7 @@ def enrich_one(cfg: dict, row: dict, progress: dict, progress_path: str, out_pat
         return True
 
     try:
-        enrichment = parse_detail_page(html)
+        enrichment = parse_detail_page(html, cfg["base_url"])
     except Exception as e:
         log_warn(f"Parse failed for {itemurl}: {e} — leaving row un-enriched")
         enrichment = {}
