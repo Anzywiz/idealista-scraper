@@ -24,6 +24,7 @@ import argparse
 import csv
 import json
 import re
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,7 +32,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from session_manager import CloudflareSession, close_all_browsers
+from session_manager import CloudflareSession, close_all_browsers, prime
 from utils import (
     load_config, log_head, log_info, log_ok, log_warn, log_err, log_step,
     parse_price, jitter_sleep, load_progress, save_progress, today_str, epoch_now,
@@ -286,26 +287,43 @@ def run(cfg: dict, only_section=None, only_category=None, fresh=False):
     total_rows = 0
     done_count = 0
 
+    prime(cfg)  # register SIGINT/SIGTERM cleanup from the main thread, before
+                # any worker thread gets a chance to create the shared browser
+    pool = ThreadPoolExecutor(max_workers=workers)
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(scrape_link, cfg, link, section_key, listing_type, category,
-                            progress, progress_path, csv_path): (section_key, category, link)
-                for section_key, listing_type, category, link in tasks
-            }
-            for fut in as_completed(futures):
-                section_key, category, link = futures[fut]
-                done_count += 1
-                try:
-                    rows = fut.result() or 0
-                    total_rows += rows
-                    log_step(done_count, len(tasks),
-                              f"{section_key}/{category.get('slug')} "
-                              f"{link.get('parish') or link.get('district') or link.get('region')} "
-                              f"(+{rows} rows)")
-                except Exception as e:
-                    log_err(f"Task failed {section_key}/{category.get('slug')} {link.get('url')}: {e}")
+        futures = {
+            pool.submit(scrape_link, cfg, link, section_key, listing_type, category,
+                        progress, progress_path, csv_path): (section_key, category, link)
+            for section_key, listing_type, category, link in tasks
+        }
+        for fut in as_completed(futures):
+            section_key, category, link = futures[fut]
+            done_count += 1
+            try:
+                rows = fut.result() or 0
+                total_rows += rows
+                log_step(done_count, len(tasks),
+                          f"{section_key}/{category.get('slug')} "
+                          f"{link.get('parish') or link.get('district') or link.get('region')} "
+                          f"(+{rows} rows)")
+            except Exception as e:
+                log_err(f"Task failed {section_key}/{category.get('slug')} {link.get('url')}: {e}")
+    except KeyboardInterrupt:
+        pending = sum(1 for f in futures if not f.done())
+        log_warn(f"Interrupted — cancelling {pending} not-yet-started task(s); "
+                 f"any already in flight will finish in a moment…")
+        raise
     finally:
+        # cancel_futures=True is the key fix: the default `with
+        # ThreadPoolExecutor() as pool:` context manager calls
+        # shutdown(wait=True) with NO cancellation, which drains the
+        # *entire* remaining task queue (potentially thousands of links)
+        # before returning — so Ctrl+C appeared to "do nothing" for a very
+        # long time, and if the terminal was killed impatiently instead,
+        # the shared browser never got a chance to close. Cancelling
+        # unstarted futures here means only the handful of tasks already
+        # mid-flight (<= workers) need to finish before we can clean up.
+        pool.shutdown(wait=True, cancel_futures=True)
         close_all_browsers()
 
     log_ok(f"Phase 2 complete — {total_rows} rows written to {csv_path}")
@@ -321,7 +339,12 @@ def main():
 
     cfg = load_config(args.config)
     log_head(f"PHASE 2 — scrape_listings (workers={cfg.get('phase2_workers', 4)})")
-    run(cfg, only_section=args.section, only_category=args.category, fresh=args.fresh)
+    try:
+        run(cfg, only_section=args.section, only_category=args.category, fresh=args.fresh)
+    except KeyboardInterrupt:
+        log_warn("Stopped by user — progress up to the last completed page was saved; "
+                 "re-run the same command to resume.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
