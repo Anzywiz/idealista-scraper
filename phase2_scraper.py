@@ -204,8 +204,19 @@ def paginated_url(base_link_url: str, page: int) -> str:
     return f"{base_link_url.rstrip('/')}/pagina-{page}"
 
 
+def link_complete_key(link: dict) -> str:
+    """Distinct from any per-page progress key (page 1's key IS link['url']
+    itself), so a whole-link 'nothing more to do here' marker can't collide
+    with a real page entry."""
+    return f"{link['url']}::complete"
+
+
 def scrape_link(cfg: dict, link: dict, section_key: str, listing_type: str,
                  category: dict, progress: dict, progress_path: str, csv_path: str) -> int:
+    complete_key = link_complete_key(link)
+    if progress.get(complete_key) == "done":
+        return 0  # fully scraped in a previous run — nothing to do
+
     session = get_thread_session(cfg)
     base_url = cfg["base_url"]
     page_size = cfg.get("listing_page_size", 30)
@@ -215,8 +226,7 @@ def scrape_link(cfg: dict, link: dict, section_key: str, listing_type: str,
     total_rows = 0
     for page in range(1, expected_pages + 1):
         url = paginated_url(link["url"], page)
-        key = f"{url}"
-        if progress.get(key) == "done":
+        if progress.get(url) == "done":
             continue
 
         html = session.get_html(url)
@@ -226,18 +236,23 @@ def scrape_link(cfg: dict, link: dict, section_key: str, listing_type: str,
 
         cards = parse_listing_cards(html, base_url)
         if not cards:
-            progress[key] = "done"
-            break  # no more listings on this link
+            progress[url] = "done"
+            break  # no more listings on this link — every page beyond this
+                   # one is implicitly covered by the completion marker below,
+                   # so resuming won't re-check pages we deliberately never
+                   # visited
 
         rows = [build_row(c, link, section_key, listing_type, category, cfg) for c in cards]
         write_rows(rows, csv_path)
         total_rows += len(rows)
 
-        progress[key] = "done"
+        progress[url] = "done"
         save_progress(progress_path, progress)
 
         jitter_sleep(cfg.get("phase2_delay_seconds", [1.5, 3.5]))
 
+    progress[complete_key] = "done"
+    save_progress(progress_path, progress)
     return total_rows
 
 
@@ -280,6 +295,23 @@ def run(cfg: dict, only_section=None, only_category=None, fresh=False):
     # skip agencias section by default: no listing_type maps to the
     # REAL-ESTATE-BASIC schema's SALE/RENTAL/AUCTION/NEW DEVELOPMENT values.
     tasks = [t for t in tasks if t[1] is not None]
+
+    # Resume support: drop links already fully scraped in a previous run
+    # BEFORE submitting anything to the pool. Without this, a restart still
+    # "resumes" correctly at the page level (each already-done page is
+    # skipped fast, no network call, no duplicate rows) — but it does so by
+    # re-submitting and re-walking every one of the already-finished links
+    # one at a time, which is why the progress counter looked like it had
+    # gone back to 1 and produced a wall of "(+0 rows)" lines instead of
+    # picking up where it left off.
+    if not fresh:
+        before = len(tasks)
+        tasks = [t for t in tasks if progress.get(link_complete_key(t[3])) != "done"]
+        skipped = before - len(tasks)
+        if skipped:
+            log_info(f"Skipping {skipped} link(s) already fully scraped in a previous run "
+                     f"— {len(tasks)} remaining")
+
     log_info(f"{len(tasks)} link(s) queued for scraping "
              f"(agencias skipped — not a property listing_type)")
 

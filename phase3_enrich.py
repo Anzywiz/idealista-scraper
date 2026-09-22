@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -26,7 +27,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from session_manager import CloudflareSession, close_all_browsers
+from session_manager import CloudflareSession, close_all_browsers, prime
 from phase2_scraper import ALL_COLUMNS
 from utils import (
     load_config, log_head, log_info, log_ok, log_warn, log_err, log_step,
@@ -173,7 +174,11 @@ def parse_agent(soup: BeautifulSoup, base_url: str) -> dict:
     out = {"agent_id": "", "agent_url": ""}
     a = soup.select_one(".advertiser-name-container a.about-advertiser-name")
     if a:
-        out["agent_url"] = urljoin(base_url, a.get("href", ""))
+        href = a.get("href", "")
+        # href is site-relative (e.g. "/pro/carlos-bento/") — resolve it
+        # against the site root so agent_url is a real, clickable link,
+        # same as phase2_scraper.py already does for the card's agent_url.
+        out["agent_url"] = urljoin(base_url, href) if href else ""
         # spans right after the name often hold the AMI licence number,
         # which is a more useful agent identifier than a URL slug
         container = a.find_parent(class_="advertiser-name-container")
@@ -318,19 +323,26 @@ def run(cfg: dict, fresh: bool = False, limit: int | None = None):
 
     workers = cfg.get("phase3_workers", 4)
     done_count = 0
+    prime(cfg)  # register SIGINT/SIGTERM cleanup from the main thread first
+    pool = ThreadPoolExecutor(max_workers=workers)
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(enrich_one, cfg, row, progress, progress_path, out_path): row
-                       for row in pending}
-            for fut in as_completed(futures):
-                row = futures[fut]
-                done_count += 1
-                try:
-                    fut.result()
-                    log_step(done_count, len(pending), f"listing {row.get('listing_id')}")
-                except Exception as e:
-                    log_err(f"Enrichment failed for listing {row.get('listing_id')}: {e}")
+        futures = {pool.submit(enrich_one, cfg, row, progress, progress_path, out_path): row
+                   for row in pending}
+        for fut in as_completed(futures):
+            row = futures[fut]
+            done_count += 1
+            try:
+                fut.result()
+                log_step(done_count, len(pending), f"listing {row.get('listing_id')}")
+            except Exception as e:
+                log_err(f"Enrichment failed for listing {row.get('listing_id')}: {e}")
+    except KeyboardInterrupt:
+        log_warn("Interrupted — cancelling not-yet-started enrichments…")
+        raise
     finally:
+        # cancel_futures=True avoids draining the entire remaining backlog
+        # before the shared browser can be closed (see phase2_scraper.py).
+        pool.shutdown(wait=True, cancel_futures=True)
         close_all_browsers()
 
     log_ok(f"Phase 3 complete — enriched CSV at {out_path}")
@@ -345,7 +357,12 @@ def main():
 
     cfg = load_config(args.config)
     log_head(f"PHASE 3 — enrich_listings (workers={cfg.get('phase3_workers', 4)})")
-    run(cfg, fresh=args.fresh, limit=args.limit)
+    try:
+        run(cfg, fresh=args.fresh, limit=args.limit)
+    except KeyboardInterrupt:
+        log_warn("Stopped by user — progress up to the last completed listing was saved; "
+                 "re-run the same command to resume.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

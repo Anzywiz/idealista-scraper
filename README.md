@@ -102,6 +102,38 @@ standard version from the web-scraper skill, pointing `ALL_COLUMNS` at the
 list in `phase2_scraper.py`, and set the enriched CSV
 (`output/listings_enriched.csv`) as its input once phase 3 is stable.
 
+## Resuming
+
+Both `phase2` and `phase3` checkpoint progress and can be safely re-run with
+the same command after a crash or Ctrl+C — pages/listings already done are
+skipped, not re-fetched or re-written. Phase 2 tracks completion two ways:
+per-page (`output/phase2_progress.json`, keyed by the exact paginated URL)
+*and* a whole-link "fully scraped" marker, so a restart filters out
+already-finished links up front rather than re-walking each one's already-
+done pages one at a time (which used to make the progress counter look like
+it had reset back to 1 and produce a wall of `(+0 rows)` lines). Use
+`--fresh` on either phase to ignore saved progress and start clean.
+
+## Known site quirk: nested `concelhos-freguesias` pages
+
+Not every entry on a district's `.../concelhos-freguesias` breakdown page is
+a genuine leaf listing page — some concelhos (e.g. Avis) point to their own
+`.../avis/concelhos-freguesias` page instead, one level deeper. `phase1`
+now resolves these recursively (up to 4 levels) instead of treating every
+entry as scrape-ready, which used to produce broken URLs like
+`.../avis/concelhos-freguesias/pagina-2` once phase 2 tried to paginate
+them. **If your `links.json` predates this fix, re-run `--phase1`** to
+regenerate it — phase 2 can't fix already-broken links on its own.
+
+## Known duplication across categories/sections
+
+`trespasse` (business transfers) has no separate buy/rent path on the
+site — `/trespasse/` is the same URL under both the Comprar and Arrendar
+menus. Phase 1 now fetches/drills each unique category URL only once and
+reuses the result for every section that maps to it (so it's not scraped
+twice), and logs a one-line summary of any URLs still shared across more
+than one (section, category) pair so this is never a silent surprise.
+
 ## Testing without hitting the live site
 
 This sandbox can't reach `idealista.pt` (not in its network allowlist), so
