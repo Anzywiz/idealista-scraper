@@ -168,6 +168,18 @@ def _sigint_handler(signum, frame):
 
 # ───────────────────────── public API ─────────────────────────
 
+def prime(cfg: dict) -> None:
+    """Call once from the MAIN thread, before spawning any worker threads
+    or ThreadPoolExecutor. signal.signal() only succeeds when called from
+    the main thread — if the very first CloudflareSession/browser init
+    happens inside a worker thread instead (as it did before this fix,
+    since get_thread_session() is only called from within scrape_link()/
+    enrich_one()), the SIGINT/SIGTERM handler silently fails to register
+    and Ctrl+C falls back to Python's default KeyboardInterrupt behavior,
+    which does NOT close the shared browser."""
+    _SharedBrowserClearance(cfg)
+
+
 class CloudflareSession:
     """Cheap to create — one per worker thread. All instances share the
     single browser above; only the curl_cffi session is per-thread."""
