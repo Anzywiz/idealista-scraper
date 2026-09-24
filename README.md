@@ -118,12 +118,17 @@ it had reset back to 1 and produce a wall of `(+0 rows)` lines). Use
 
 Not every entry on a district's `.../concelhos-freguesias` breakdown page is
 a genuine leaf listing page — some concelhos (e.g. Avis) point to their own
-`.../avis/concelhos-freguesias` page instead, one level deeper. `phase1`
-now resolves these recursively (up to 4 levels) instead of treating every
-entry as scrape-ready, which used to produce broken URLs like
-`.../avis/concelhos-freguesias/pagina-2` once phase 2 tried to paginate
-them. **If your `links.json` predates this fix, re-run `--phase1`** to
-regenerate it — phase 2 can't fix already-broken links on its own.
+`.../avis/concelhos-freguesias` page instead, one level deeper, and some
+neighbouring concelhos' pages cross-link each other (a "nearby areas" style
+widget) rather than showing their own freguesia breakdown at all. `phase1`
+now resolves these recursively with a cycle guard: it never re-fetches a
+URL it's already visited in the same drill, and if a concelho's own page
+never yields a genuine leaf (either through max depth or a cross-linking
+loop), it falls back to that concelho's plain listing page
+(`.../moncao/concelhos-freguesias` → `.../moncao/`) instead of writing the
+broken index URL into `links.json`. **If your `links.json` predates this
+fix, re-run `--phase1`** to regenerate it — phase 2 can't fix already-broken
+links on its own.
 
 ## Known duplication across categories/sections
 
@@ -133,6 +138,37 @@ menus. Phase 1 now fetches/drills each unique category URL only once and
 reuses the result for every section that maps to it (so it's not scraped
 twice), and logs a one-line summary of any URLs still shared across more
 than one (section, category) pair so this is never a silent surprise.
+
+## Throughput: the browser pool
+
+On this site, curl_cffi ends up Cloudflare-blocked on almost every request
+once the "Performing security verification" challenge is active — a real
+browser's cookies don't reliably transfer to curl_cffi's TLS-impersonated
+requests. Routing every blocked request through a single shared browser
+(the earlier fix) meant throughput was capped at ~1 request per ~12–15s
+*no matter how many worker threads were running*, since they all queued
+behind the same browser.
+
+`session_manager.py` now runs a **pool** of `browser_pool_size` (config,
+default `3`) independent SeleniumBase browsers, each with its own lock —
+so that many blocked requests resolve concurrently instead of serializing.
+Throughput now scales with pool size instead of being capped at 1. On top
+of that:
+
+- `prime(cfg)` warms up every pool slot against the homepage *before* any
+  real scraping starts, so the pool already holds valid cookies instead of
+  every worker paying the clearance cost on its first real request.
+- A circuit breaker tracks curl_cffi's recent success rate: after 5
+  consecutive failures it's skipped entirely for the next 20 requests
+  (going straight to the pool), instead of wasting an attempt+timeout on
+  every single call once it's clearly not working for the current session.
+
+**Tuning `browser_pool_size`:** each slot is a full (optionally headed)
+Chrome instance, so this trades RAM/CPU for throughput. Start at `3`; if
+your machine has headroom, raise it towards `phase2_workers`/
+`phase3_workers` so every worker thread can get a browser slot without
+queuing. Lower it if Chrome instances are competing for memory. Headless
+(`"headed": false`) also helps scale the pool higher on the same hardware.
 
 ## Testing without hitting the live site
 

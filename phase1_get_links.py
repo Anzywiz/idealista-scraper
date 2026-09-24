@@ -131,34 +131,60 @@ def _is_index_link(url: str) -> bool:
     return INDEX_PAGE_MARKER in url
 
 
+def _plain_listing_url(index_url: str) -> str:
+    """Derive the plain, directly-scrapable listing URL for an index page
+    by stripping the 'concelhos-freguesias' segment — e.g.
+    '.../moncao/concelhos-freguesias' -> '.../moncao/'. The site exposes
+    this kind of plain concelho-level listing page (confirmed by the
+    '/comprar-casas/torres-novas/' quick-link pattern seen on the
+    homepage), so it's always a safe, real fallback — unlike writing the
+    unresolved index URL itself into links.json."""
+    base = index_url.split(INDEX_PAGE_MARKER)[0]
+    return base if base.endswith("/") else base + "/"
+
+
 def resolve_leaf_links(session: CloudflareSession, cfg: dict, root_url: str,
                         url: str, count: int, region_name: str, district_name: str,
                         max_depth: int = 4) -> list[dict]:
     """Iteratively drill an index page (and any further index pages it
     points to) down to genuine leaf listing links. Handles arbitrary
     nesting depth instead of assuming district -> parish is always exactly
-    one hop."""
+    one hop.
+
+    Some concelhos-freguesias pages include a "nearby areas" style widget
+    alongside the genuine freguesia list, which can point back to sibling
+    concelhos' own index pages — without a cycle guard, neighbouring
+    concelhos can end up drilling into each other indefinitely. `visited`
+    stops any URL from being fetched more than once per call."""
     leaves: list[dict] = []
     stack: list[tuple[str, int, Optional[str]]] = [(url, count, None)]
     depth_map = {url: 0}
+    visited: set[str] = set()
+
+    def _give_up(reason_url: str, reason_count: int, reason_name: Optional[str], why: str) -> None:
+        fallback_url = _plain_listing_url(reason_url)
+        log_warn(f"{why} at {reason_url} — using its plain listing page instead: {fallback_url}")
+        leaves.append({
+            "url": fallback_url, "count": reason_count, "granularity": "unresolved",
+            "region": region_name, "district": district_name,
+            "parish": reason_name or district_name,
+        })
 
     while stack:
         cur_url, cur_count, concelho_name = stack.pop()
+        if cur_url in visited:
+            continue  # already resolved (or being resolved) via another path this run
+        visited.add(cur_url)
+
         depth = depth_map.get(cur_url, 0)
         if depth > max_depth:
-            log_warn(f"Max drill depth ({max_depth}) reached at {cur_url} — using it as-is; "
-                     f"pagination may not work if this is still an index page.")
-            leaves.append({
-                "url": cur_url, "count": cur_count, "granularity": "unresolved",
-                "region": region_name, "district": district_name,
-                "parish": concelho_name or district_name,
-            })
+            _give_up(cur_url, cur_count, concelho_name, f"Max drill depth ({max_depth}) reached")
             continue
 
         html = session.get_html(cur_url)
         jitter_sleep(cfg.get("phase1_delay_seconds", [1.0, 2.0]))
         if not html:
-            log_warn(f"Failed to fetch index page: {cur_url}")
+            _give_up(cur_url, cur_count, concelho_name, "Failed to fetch index page")
             continue
 
         entries = parse_parish_list(html, root_url)
@@ -171,15 +197,34 @@ def resolve_leaf_links(session: CloudflareSession, cfg: dict, root_url: str,
             })
             continue
 
+        contributed = False
         for e in entries:
             if _is_index_link(e["url"]):
-                stack.append((e["url"], e["count"], e["name"]))
-                depth_map[e["url"]] = depth + 1
+                if e["url"] not in visited:
+                    stack.append((e["url"], e["count"], e["name"]))
+                    depth_map[e["url"]] = depth + 1
+                # NOTE: pushing a further index link does NOT count as
+                # cur_url "contributing" — the entries on cur_url's own
+                # page can be pure noise (a "nearby areas" widget pointing
+                # at sibling concelhos rather than real sub-divisions of
+                # cur_url itself), so cur_url still needs its own fallback
+                # below unless it produced a genuine leaf.
             else:
                 leaves.append({
                     "url": e["url"], "count": e["count"], "granularity": "parish",
                     "region": region_name, "district": district_name, "parish": e["name"],
                 })
+                contributed = True
+
+        if not contributed:
+            # cur_url's own page never yielded a genuine (non-index) leaf —
+            # either every entry was a cross-link to a sibling concelho
+            # (real-world case: neighbouring concelhos' pages showing each
+            # other as "nearby areas" instead of real sub-divisions), or a
+            # cycle meant every entry was already visited. Either way,
+            # cur_url's own listings must not be silently dropped.
+            _give_up(cur_url, cur_count, concelho_name,
+                     "This index page produced no genuine leaf links of its own")
 
     return leaves
 
