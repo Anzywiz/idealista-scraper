@@ -49,7 +49,16 @@ WHAT CHANGED FROM v3, AND WHY:
    on launch so you can confirm in the logs that slots are genuinely
    distinct processes.
 
-5. Smarter circuit breaker. v3 tripped after a fixed 5 straight failures
+5. Periodic browser recycling. Each slot now closes and relaunches its own
+   Chrome process every `browser_recycle_after_requests` fetches (jittered
+   per slot so they don't all recycle on the same fetch) or after
+   `browser_recycle_after_seconds`, whichever comes first — a long-lived
+   Chrome process on this site appears to accumulate a worse Cloudflare
+   trust score over a run, matching the observed pattern of a run getting
+   noticeably buggier after 60-80 requests and a plain script restart
+   (same on-disk profile, brand-new process) clearing it back up.
+
+6. Smarter circuit breaker. v3 tripped after a fixed 5 straight failures
    and always cooled down for a fixed 20 requests, and kept incrementing
    the fail streak forever after tripping (which is why the "5 times in a
    row" message kept firing). Now: the trip threshold is raised and
@@ -126,6 +135,9 @@ class _BrowserSlot:
         self.lock = threading.RLock()
         self._sb = None
         self._sb_cm = None
+        self._fetch_count = 0
+        self._launched_at = None
+        self._recycle_at_count = None
 
     def _ensure_browser(self):
         if self._sb is not None:
@@ -164,7 +176,45 @@ class _BrowserSlot:
             log_ok(f"Slot #{self.slot_id} launched (session_id={session_id}) "
                    f"— compare session_ids across slots if fetches ever look like they're "
                    f"landing on the same browser again")
+
+            self._launched_at = time.monotonic()
+            self._fetch_count = 0
+            base = self.cfg.get("browser_recycle_after_requests", 25)
+            jitter = self.cfg.get("browser_recycle_jitter", 5)
+            # jitter desyncs slots so they don't all hit their recycle point
+            # on the same fetch and momentarily drop the pool to 0 capacity
+            self._recycle_at_count = (base + random.randint(-jitter, jitter)) if base else None
         return self._sb
+
+    def _close_locked(self) -> None:
+        """Assumes self.lock is already held."""
+        if self._sb_cm is not None:
+            log_info(f"Closing browser pool slot #{self.slot_id}…")
+            try:
+                self._sb_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._sb_cm = None
+            self._sb = None
+
+    def _maybe_recycle(self) -> None:
+        """Assumes self.lock is already held. A long-lived Chrome process on
+        this site appears to accumulate a worse Cloudflare trust score over
+        a run (matches the observed pattern: a fresh script restart — same
+        profile dir, brand-new Chrome process — clears the bugginess for
+        another 60-80 requests) — so periodically kill and relaunch the
+        browser itself rather than only re-navigating it for fresh cookies."""
+        if self._sb is None:
+            return  # nothing running yet, nothing to recycle
+        recycle_after_seconds = self.cfg.get("browser_recycle_after_seconds", 1800)
+        age = (time.monotonic() - self._launched_at) if self._launched_at else 0
+        due_by_count = self._recycle_at_count and self._fetch_count >= self._recycle_at_count
+        due_by_age = recycle_after_seconds and age >= recycle_after_seconds
+        if due_by_count or due_by_age:
+            reason = f"{self._fetch_count} fetches" if due_by_count else f"{int(age)}s old"
+            log_info(f"Slot #{self.slot_id} recycling browser ({reason}) — closing and "
+                     f"relaunching a fresh Chrome process before the next fetch")
+            self._close_locked()
 
     def _wait_for_clearance(self, sb) -> str:
         """Poll instead of blindly sleeping the full budget: many loads on
@@ -199,6 +249,7 @@ class _BrowserSlot:
         user_agent). Blocks other callers of THIS slot until done — other
         slots are unaffected, which is what gives the pool its concurrency."""
         with self.lock:
+            self._maybe_recycle()
             sb = self._ensure_browser()
             sb.activate_cdp_mode(url)
             html = self._wait_for_clearance(sb)
@@ -208,18 +259,12 @@ class _BrowserSlot:
                 user_agent = sb.execute_script("return navigator.userAgent")
             except Exception:
                 pass
+            self._fetch_count += 1
             return html, cookies, user_agent
 
     def close(self) -> None:
         with self.lock:
-            if self._sb_cm is not None:
-                log_info(f"Closing browser pool slot #{self.slot_id}…")
-                try:
-                    self._sb_cm.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._sb_cm = None
-                self._sb = None
+            self._close_locked()
 
 
 class _BrowserPool:
