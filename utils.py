@@ -1,8 +1,8 @@
 """
 Shared helpers for the idealista.pt scraper.
 
-- colour logging
-- config loading
+- colour logging (full date+time timestamps, no ascii progress bar)
+- config loading (+ minimal .env loader for PROXY_URL etc.)
 - Portuguese-locale number parsing ("1.769" -> 1769)
 - a CloudflareSession wrapper: tries curl_cffi first, escalates to
   SeleniumBase (undetected-chrome / CDP mode) when Cloudflare blocks it,
@@ -12,9 +12,11 @@ Shared helpers for the idealista.pt scraper.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -32,7 +34,9 @@ class C:
 
 
 def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    # Full date+time (not just HH:MM:SS) so a run that spans past midnight,
+    # or a log file you come back to the next day, is unambiguous.
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def log_head(msg: str) -> None:
@@ -56,16 +60,48 @@ def log_err(msg: str) -> None:
     print(f"{C.RED}[{_ts()}] ✖ {msg}{C.RESET}", file=sys.stderr)
 
 
-def log_step(i: int, n: int, msg: str, width: int = 24) -> None:
+def log_step(i: int, n: int, msg: str) -> None:
+    # Plain "[timestamp] [i/n] msg" — no ascii block-bar. The bar added no
+    # information (it's just i/n again, redrawn as blocks) and made log
+    # files/terminals noisy; the timestamp is the useful addition here.
     n = max(n, 1)
-    filled = int(width * min(i, n) / n)
-    bar = "█" * filled + "░" * (width - filled)
-    print(f"{C.CYAN}[{bar}] {i}/{n} {msg}{C.RESET}")
+    print(f"{C.CYAN}[{_ts()}] [{i}/{n}] {msg}{C.RESET}")
 
 
-# ───────────────────────── config ─────────────────────────
+# ───────────────────────── config / env ─────────────────────────
+
+def load_dotenv(path: str = ".env") -> None:
+    """Minimal .env loader — no external dependency (python-dotenv isn't
+    required). Sets os.environ for any KEY=VALUE line found in the file,
+    but never overrides a variable that's already set in the real
+    environment (so `PROXY_URL=... python main.py ...` on the command
+    line still wins over the .env file). Blank lines and '#' comments are
+    ignored; surrounding quotes on the value are stripped."""
+    p = Path(path)
+    if not p.exists():
+        return
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def get_proxy_url() -> Optional[str]:
+    """PROXY_URL from the environment (real env var or .env file, loaded
+    once by load_config() below). A single URL is expected — e.g. a
+    rotating-proxy gateway that hands out a different exit IP per
+    connection — used as-is for both curl_cffi and the browser pool."""
+    return os.environ.get("PROXY_URL") or None
+
 
 def load_config(path: str = "config.json") -> dict:
+    load_dotenv()  # populate os.environ with PROXY_URL etc. before anything reads it
+
     cfg_path = Path(path)
     if not cfg_path.exists():
         raise FileNotFoundError(f"config file not found: {path}")
@@ -78,6 +114,10 @@ def load_config(path: str = "config.json") -> dict:
     if lang not in cfg.get("base_urls", {}):
         raise ValueError(f"language '{lang}' not present in base_urls")
     cfg["base_url"] = cfg["base_urls"][lang].rstrip("/")
+
+    if get_proxy_url():
+        log_info("PROXY_URL detected — curl_cffi and the browser pool will route through it")
+
     return cfg
 
 
@@ -204,6 +244,40 @@ def load_progress(path: str) -> dict:
 
 def save_progress(path: str, progress: dict) -> None:
     Path(path).write_text(json.dumps(progress, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+class ProgressStore:
+    """Thread-safe wrapper around a progress dict + its JSON file.
+
+    Plain dicts aren't safe to mutate from multiple threads at once:
+    json.dumps() (inside save_progress) iterates over every key, and if
+    another worker thread inserts a NEW key into the same dict object
+    while that iteration is mid-flight, Python raises "dictionary changed
+    size during iteration". With several worker threads all calling
+    save_progress() on the same shared dict after every page/listing, this
+    is a real, not-just-theoretical race — every read, write, and save
+    here goes through a single lock so it can't happen."""
+
+    def __init__(self, path: str, data: Optional[dict] = None):
+        self.path = path
+        self._lock = threading.Lock()
+        self._data: dict = data if data is not None else {}
+
+    @classmethod
+    def load(cls, path: str, fresh: bool = False) -> "ProgressStore":
+        return cls(path, {} if fresh else load_progress(path))
+
+    def is_done(self, key: str) -> bool:
+        with self._lock:
+            return self._data.get(key) == "done"
+
+    def mark_done(self, key: str) -> None:
+        with self._lock:
+            self._data[key] = "done"
+            self._save_locked()
+
+    def _save_locked(self) -> None:
+        Path(self.path).write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ───────────────────────── retry decorator-ish helper ─────────────────────────

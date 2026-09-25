@@ -31,7 +31,7 @@ from session_manager import CloudflareSession, close_all_browsers, prime
 from phase2_scraper import ALL_COLUMNS
 from utils import (
     load_config, log_head, log_info, log_ok, log_warn, log_err, log_step,
-    parse_price, jitter_sleep, load_progress, save_progress, parse_pt_date,
+    parse_price, jitter_sleep, ProgressStore, parse_pt_date,
 )
 
 AREA_RE = re.compile(r"([\d.,]+)\s*m²\s*área bruta(?:,\s*([\d.,]+)\s*m²\s*úteis?)?", re.IGNORECASE)
@@ -261,16 +261,16 @@ def write_row(row: dict, path: str):
         writer.writerow(row)
 
 
-def enrich_one(cfg: dict, row: dict, progress: dict, progress_path: str, out_path: str) -> bool:
+def enrich_one(cfg: dict, row: dict, progress: ProgressStore, out_path: str) -> bool:
     listing_id = row.get("listing_id") or row.get("itemurl")
     if not listing_id:
         return False
-    if progress.get(listing_id) == "done":
+    if progress.is_done(listing_id):
         return False
 
     itemurl = row.get("itemurl")
     if not itemurl:
-        progress[listing_id] = "done"
+        progress.mark_done(listing_id)
         return False
 
     session = get_thread_session(cfg)
@@ -278,8 +278,7 @@ def enrich_one(cfg: dict, row: dict, progress: dict, progress_path: str, out_pat
     if not html:
         log_warn(f"No HTML for {itemurl} — leaving row un-enriched")
         write_row(row, out_path)
-        progress[listing_id] = "done"
-        save_progress(progress_path, progress)
+        progress.mark_done(listing_id)
         return True
 
     try:
@@ -290,8 +289,7 @@ def enrich_one(cfg: dict, row: dict, progress: dict, progress_path: str, out_pat
 
     merged = merge_row(row, enrichment)
     write_row(merged, out_path)
-    progress[listing_id] = "done"
-    save_progress(progress_path, progress)
+    progress.mark_done(listing_id)
 
     jitter_sleep(cfg.get("phase3_delay_seconds", [1.5, 3.5]))
     return True
@@ -312,13 +310,12 @@ def run(cfg: dict, fresh: bool = False, limit: int | None = None):
 
     out_path = cfg.get("phase3_enriched_csv", "output/listings_enriched.csv")
     progress_path = cfg.get("phase3_progress_file", "output/phase3_progress.json")
-    progress = {} if fresh else load_progress(progress_path)
+    progress = ProgressStore.load(progress_path, fresh=fresh)
 
     if fresh and Path(out_path).exists():
         Path(out_path).unlink()
 
-    pending = [r for r in rows if (r.get("listing_id") or r.get("itemurl")) not in progress
-               or progress.get(r.get("listing_id") or r.get("itemurl")) != "done"]
+    pending = [r for r in rows if not progress.is_done(r.get("listing_id") or r.get("itemurl"))]
     log_info(f"{len(pending)} of {len(rows)} listing(s) need enrichment")
 
     workers = cfg.get("phase3_workers", 4)
@@ -326,7 +323,7 @@ def run(cfg: dict, fresh: bool = False, limit: int | None = None):
     prime(cfg)  # register SIGINT/SIGTERM cleanup from the main thread first
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = {pool.submit(enrich_one, cfg, row, progress, progress_path, out_path): row
+        futures = {pool.submit(enrich_one, cfg, row, progress, out_path): row
                    for row in pending}
         for fut in as_completed(futures):
             row = futures[fut]

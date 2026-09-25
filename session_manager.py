@@ -1,57 +1,95 @@
 """
 CloudflareSession — a lightweight per-thread object used by phase1/2/3.
 
-v3 — browser POOL instead of a single shared browser.
+v4 — proxy support, adaptive Cloudflare wait, a proactive background
+session-refresher, serialized browser launches, and a smarter curl_cffi
+circuit breaker. Builds on v3's browser POOL design.
 
-Why: on this site, curl_cffi ends up blocked on virtually every request
-once Cloudflare is in "Performing security verification" mode — cookies
-obtained by a real browser don't reliably transfer to curl_cffi's TLS-
-impersonated requests. With a single shared browser (v2), that meant every
-fetch serialized through one lock — throughput was ~1 request per ~12-15s
-*no matter how many worker threads were configured*, since they were all
-waiting on the same browser.
+WHAT CHANGED FROM v3, AND WHY:
 
-v3 fixes this the way the user asked for: a POOL of `browser_pool_size`
-independent SeleniumBase browsers (each with its own lock), so that many
-Cloudflare-blocked requests can be resolved concurrently — throughput now
-scales with pool size instead of being capped at 1. On top of that:
-  * `prime(cfg)` warms up every pool slot against the homepage BEFORE any
-    real scraping starts, so the pool is already holding valid cookies
-    instead of paying the clearance cost on the first real request.
-  * A simple circuit breaker tracks curl_cffi's recent success rate; once
-    it's failed several times in a row, curl_cffi is skipped for a cooldown
-    window and requests go straight to the pool, saving the wasted
-    attempt+timeout on every single call when curl_cffi clearly isn't
-    working for the current session.
-  * The whole pool is registered for cleanup via atexit AND a SIGINT/
-    SIGTERM handler, so Ctrl+C actually closes every browser instead of
-    leaving orphaned Chrome processes behind.
+1. Proxies (.env PROXY_URL). A single rotating-proxy URL, if present in
+   the environment (or a .env file next to the scripts), is applied to
+   BOTH curl_cffi's session and every SeleniumBase pool slot. Nothing
+   changes if PROXY_URL isn't set.
 
-Strategy per request:
+2. Adaptive Cloudflare wait. v3 always slept the full
+   `cloudflare_wait_seconds` (default 25s) on every single browser fetch,
+   even when the page loaded clean with no challenge at all. Now the pool
+   polls the page every `cloudflare_poll_interval_seconds` and returns as
+   soon as the Cloudflare markers are gone, instead of always paying the
+   full fixed wait — only a genuinely-challenged page waits the full
+   budget.
+
+3. Proactive background session refresher. v3 only ever sent a browser to
+   refresh cookies REACTIVELY — after curl_cffi had already failed on a
+   real request. That means curl_cffi is scraping on a decaying session
+   the whole time between clearances, guaranteeing a rising 429 rate right
+   up until the next failure forces a refresh. Now a background thread
+   proactively cycles an idle pool slot every
+   `session_refresh_interval_seconds` purely to mint a fresh session and
+   broadcast its cookies — independent of whether anything has failed —
+   so curl_cffi is kept riding a young session instead of only being
+   rescued after the fact. If every slot is busy with real scraping when
+   a refresh is due, that cycle is skipped (real traffic is already
+   refreshing cookies just by hitting the browser pool) rather than
+   competing with it.
+
+4. Serialized browser launches. The actual bug behind "only one Chrome
+   really opens a page, but the logs show all of them succeeding": v3's
+   warm_up() launched every pool slot's undetected-chromedriver instance
+   from separate threads AT THE SAME TIME. Concurrent UC-mode launches can
+   race on chromedriver's local port/profile-lock selection — a later
+   launch can end up silently attached to an EARLIER instance's Chrome
+   process instead of spawning its own, so two "slots" are actually
+   driving the same tab; each slot's log lines are honest about what THAT
+   thread asked for, but not about which physical browser it landed on.
+   Fix: browser launches (not fetches — those still run fully concurrently
+   once a slot is up) are now serialized through a single lock with a
+   short stagger between them, and each slot logs its driver session_id
+   on launch so you can confirm in the logs that slots are genuinely
+   distinct processes.
+
+5. Smarter circuit breaker. v3 tripped after a fixed 5 straight failures
+   and always cooled down for a fixed 20 requests, and kept incrementing
+   the fail streak forever after tripping (which is why the "5 times in a
+   row" message kept firing). Now: the trip threshold is raised and
+   configurable (retry more before giving up on curl_cffi entirely), each
+   consecutive trip grows the cooldown (persistent blocking backs off
+   further) while any clean success resets the trip count back to zero
+   (a blip recovers fast), and the fail streak itself resets on trip so it
+   doesn't uselessly keep counting past the threshold.
+
+Strategy per request (unchanged in spirit from v3):
   1. If the circuit breaker says curl_cffi is currently worth trying, try
-     it first (fast, no browser).
+     it first (fast, no browser) — retrying once with a different TLS
+     impersonation profile before counting the request as a failure.
   2. If blocked / shows the Cloudflare interstitial (or the breaker says
-     skip it), hand the fetch to the pool: grab a slot (round-robin; a
-     slot's own lock provides backpressure if it's mid-fetch), navigate
-     with SeleniumBase uc=True CDP mode, solve the challenge if present.
+     skip it), hand the fetch to the pool: grab a slot (round-robin via a
+     checkout queue; a slot's own lock provides backpressure if it's
+     mid-fetch), navigate with SeleniumBase uc=True CDP mode, solve the
+     challenge if present, polling instead of blindly sleeping the full
+     wait.
   3. Broadcast the resulting cookies + user agent to every thread's
      curl_cffi session, so opportunistic curl_cffi attempts keep being
-     worth trying whenever the site allows it.
+     worth trying whenever the site allows it — topped up continuously by
+     the background refresher, not just after failures.
 """
 
 from __future__ import annotations
 
 import atexit
+import queue
 import random
 import signal
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from curl_cffi import requests as cffi_requests
 
-from utils import log_info, log_ok, log_warn, log_err, looks_like_cloudflare
+from utils import log_info, log_ok, log_warn, log_err, looks_like_cloudflare, get_proxy_url
 
 IMPERSONATE_PROFILES = ["chrome124", "chrome120", "chrome123"]
 
@@ -61,9 +99,21 @@ DEFAULT_HEADERS = {
     "upgrade-insecure-requests": "1",
 }
 
-# curl_cffi circuit breaker tuning
-CIRCUIT_BREAKER_THRESHOLD = 5     # consecutive curl_cffi failures before tripping
-CIRCUIT_BREAKER_COOLDOWN = 20     # requests to skip curl_cffi for once tripped
+# Fallback circuit-breaker tuning (all overridable via config.json)
+DEFAULT_CB_THRESHOLD = 8       # consecutive curl_cffi failures before tripping
+DEFAULT_CB_COOLDOWN_BASE = 15  # requests to skip curl_cffi for, on the FIRST trip
+DEFAULT_CB_COOLDOWN_GROWTH = 1.6  # each successive trip multiplies the cooldown by this
+
+# Serializes undetected-chromedriver LAUNCHES (not fetches) across every
+# slot in the process, to avoid the port/profile-lock race described above.
+_LAUNCH_LOCK = threading.Lock()
+_LAST_LAUNCH_MONOTONIC = [0.0]
+
+
+def _proxy_dict(proxy_url: Optional[str]) -> Optional[dict]:
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
 
 
 class _BrowserSlot:
@@ -82,17 +132,67 @@ class _BrowserSlot:
             return self._sb
         from seleniumbase import SB
 
-        log_info(f"Launching browser pool slot #{self.slot_id} (uc=True, CDP mode)…")
-        profile_dir = self.cfg.get("chrome_profile_dir", "output/chrome_profile")
-        self._sb_cm = SB(
-            uc=True,
-            test=True,
-            locale=self.cfg.get("language", "pt"),
-            headed=bool(self.cfg.get("headed", True)),
-            user_data_dir=f"{profile_dir}_slot{self.slot_id}",
-        )
-        self._sb = self._sb_cm.__enter__()
+        with _LAUNCH_LOCK:
+            if self._sb is not None:  # someone else launched it while we waited
+                return self._sb
+            stagger = self.cfg.get("browser_launch_stagger_seconds", 2.0)
+            elapsed = time.monotonic() - _LAST_LAUNCH_MONOTONIC[0]
+            if elapsed < stagger:
+                time.sleep(stagger - elapsed)
+
+            log_info(f"Launching browser pool slot #{self.slot_id} (uc=True, CDP mode)…")
+            profile_dir = self.cfg.get("chrome_profile_dir", "output/chrome_profile")
+            sb_kwargs = dict(
+                uc=True,
+                test=True,
+                locale=self.cfg.get("language", "pt"),
+                headed=bool(self.cfg.get("headed", True)),
+                user_data_dir=f"{profile_dir}_slot{self.slot_id}",
+            )
+            proxy = get_proxy_url()
+            if proxy:
+                sb_kwargs["proxy"] = proxy
+            self._sb_cm = SB(**sb_kwargs)
+            self._sb = self._sb_cm.__enter__()
+            _LAST_LAUNCH_MONOTONIC[0] = time.monotonic()
+
+            session_id = None
+            try:
+                session_id = self._sb.driver.session_id
+            except Exception:
+                pass
+            log_ok(f"Slot #{self.slot_id} launched (session_id={session_id}) "
+                   f"— compare session_ids across slots if fetches ever look like they're "
+                   f"landing on the same browser again")
         return self._sb
+
+    def _wait_for_clearance(self, sb) -> str:
+        """Poll instead of blindly sleeping the full budget: many loads on
+        this site hit no Cloudflare interstitial at all, so return the
+        moment the page is clean rather than always paying the max wait."""
+        max_wait = self.cfg.get("cloudflare_wait_seconds", 25)
+        poll = max(0.25, self.cfg.get("cloudflare_poll_interval_seconds", 1.0))
+
+        first_look = min(1.0, max_wait)
+        sb.sleep(first_look)
+        waited = first_look
+
+        html = sb.get_page_source()
+        if not looks_like_cloudflare(html):
+            return html  # cleared instantly — no challenge was shown at all
+
+        while waited < max_wait:
+            try:
+                sb.solve_captcha()
+            except Exception:
+                pass
+            sb.sleep(poll)
+            waited += poll
+            html = sb.get_page_source()
+            if not looks_like_cloudflare(html):
+                return html  # cleared early — stop waiting the rest of the budget
+
+        return html  # still blocked after the full budget; caller logs it
 
     def fetch(self, url: str) -> tuple[Optional[str], list, Optional[str]]:
         """Navigate this slot's browser to url and return (html, cookies,
@@ -101,13 +201,7 @@ class _BrowserSlot:
         with self.lock:
             sb = self._ensure_browser()
             sb.activate_cdp_mode(url)
-            sb.sleep(self.cfg.get("cloudflare_wait_seconds", 25))
-            try:
-                sb.solve_captcha()
-            except Exception:
-                pass
-            sb.sleep(2)
-            html = sb.get_page_source()
+            html = self._wait_for_clearance(sb)
             cookies = sb.get_cookies()
             user_agent = None
             try:
@@ -132,7 +226,8 @@ class _BrowserPool:
     """Process-wide singleton: a fixed pool of browser slots, shared by
     every worker thread/CloudflareSession, plus the curl_cffi circuit
     breaker state (a property of "is this site currently blocking us",
-    which is global, not per-thread)."""
+    which is global, not per-thread), and the proactive session
+    refresher."""
 
     _instance: "_BrowserPool | None" = None
     _create_lock = threading.Lock()
@@ -149,8 +244,13 @@ class _BrowserPool:
         self.cfg = cfg
         size = max(1, int(cfg.get("browser_pool_size", 3)))
         self.slots = [_BrowserSlot(cfg, i) for i in range(size)]
-        self._rr_index = 0
-        self._rr_lock = threading.Lock()
+        # A checkout queue instead of blind round-robin: _pick_slot()
+        # blocks until an actually-IDLE slot is available, so a request
+        # never queues behind a busy slot while a different slot sits idle
+        # waiting for its "turn" in a fixed rotation.
+        self._available: "queue.Queue[_BrowserSlot]" = queue.Queue()
+        for slot in self.slots:
+            self._available.put(slot)
 
         self.cookie_lock = threading.Lock()
         self.cookies: list = []
@@ -160,38 +260,53 @@ class _BrowserPool:
         self._curl_fail_streak = 0
         self._total_requests = 0
         self._curl_disabled_until = 0
+        self._cb_trip_count = 0
+        self.cb_threshold = cfg.get("circuit_breaker_threshold", DEFAULT_CB_THRESHOLD)
+        self.cb_cooldown_base = cfg.get("circuit_breaker_cooldown_base", DEFAULT_CB_COOLDOWN_BASE)
+        self.cb_cooldown_growth = cfg.get("circuit_breaker_cooldown_growth", DEFAULT_CB_COOLDOWN_GROWTH)
 
         self._warmed_up = False
+        self._shutdown = False
+        self._refresher_thread: Optional[threading.Thread] = None
         _register_for_cleanup(self)
 
     # ── pool dispatch ──────────────────────────────────────────
-    def _pick_slot(self) -> _BrowserSlot:
-        with self._rr_lock:
-            slot = self.slots[self._rr_index % len(self.slots)]
-            self._rr_index += 1
-        return slot
+    def _checkout_slot(self) -> _BrowserSlot:
+        return self._available.get()  # blocks only when every slot is busy
 
-    def refresh_clearance(self, url: str) -> Optional[str]:
-        slot = self._pick_slot()
-        try:
-            html, cookies, user_agent = slot.fetch(url)
-        except Exception as e:
-            log_err(f"Browser pool slot #{slot.slot_id} fetch failed for {url}: {e}")
-            return None
+    def _checkin_slot(self, slot: _BrowserSlot) -> None:
+        self._available.put(slot)
+
+    def _broadcast(self, cookies: list, user_agent: Optional[str]) -> None:
         with self.cookie_lock:
             self.cookies = cookies
             if user_agent:
                 self.user_agent = user_agent
-        ok = not looks_like_cloudflare(html)
-        (log_ok if ok else log_warn)(
-            f"Slot #{slot.slot_id} {'cleared Cloudflare' if ok else 'still blocked'} for {url}"
-        )
-        return html
+
+    def refresh_clearance(self, url: str) -> Optional[str]:
+        slot = self._checkout_slot()
+        try:
+            try:
+                html, cookies, user_agent = slot.fetch(url)
+            except Exception as e:
+                log_err(f"Browser pool slot #{slot.slot_id} fetch failed for {url}: {e}")
+                return None
+            self._broadcast(cookies, user_agent)
+            ok = not looks_like_cloudflare(html)
+            (log_ok if ok else log_warn)(
+                f"Slot #{slot.slot_id} {'cleared Cloudflare' if ok else 'still blocked'} for {url}"
+            )
+            return html
+        finally:
+            self._checkin_slot(slot)
 
     def warm_up(self) -> None:
         """Visit the homepage on every pool slot BEFORE real scraping
         starts, so the pool already holds valid cookies instead of paying
-        the clearance cost on the first real request from each slot."""
+        the clearance cost on the first real request from each slot.
+        Launches are serialized (via _LAUNCH_LOCK inside _ensure_browser),
+        so running this concurrently across slots is safe now — it just
+        queues the actual browser-startup moment for each one."""
         with self.breaker_lock:
             if self._warmed_up:
                 return
@@ -203,10 +318,7 @@ class _BrowserPool:
         def _warm_one(slot: _BrowserSlot):
             try:
                 html, cookies, user_agent = slot.fetch(home)
-                with self.cookie_lock:
-                    self.cookies = cookies
-                    if user_agent:
-                        self.user_agent = user_agent
+                self._broadcast(cookies, user_agent)
                 ok = not looks_like_cloudflare(html)
                 (log_ok if ok else log_warn)(
                     f"Slot #{slot.slot_id} warm-up {'cleared Cloudflare' if ok else 'still blocked'}"
@@ -218,6 +330,52 @@ class _BrowserPool:
             futures = [pool.submit(_warm_one, slot) for slot in self.slots]
             for fut in as_completed(futures):
                 fut.result()
+
+    def start_background_refresher(self) -> None:
+        """Keep curl_cffi's session young proactively, not just after a
+        failure. Every `session_refresh_interval_seconds`, borrow an idle
+        slot (skip the cycle entirely if every slot is busy — real
+        scraping traffic through the pool refreshes cookies too) and mint
+        a fresh clearance purely to keep the broadcast cookies current."""
+        if self._refresher_thread is not None:
+            return
+        interval = self.cfg.get("session_refresh_interval_seconds", 20)
+        if interval <= 0:
+            return  # disabled via config
+
+        def _loop():
+            home = self.cfg["base_urls"]["pt"].rstrip("/") + "/"
+            while not self._shutdown:
+                # sleep in small increments so shutdown is responsive
+                slept = 0.0
+                while slept < interval and not self._shutdown:
+                    time.sleep(min(0.5, interval - slept))
+                    slept += 0.5
+                if self._shutdown:
+                    return
+                try:
+                    slot = self._available.get(timeout=3)
+                except queue.Empty:
+                    continue  # pool fully busy — skip this cycle
+                try:
+                    html, cookies, user_agent = slot.fetch(home)
+                    self._broadcast(cookies, user_agent)
+                    ok = not looks_like_cloudflare(html)
+                    (log_ok if ok else log_warn)(
+                        f"Background refresh via slot #{slot.slot_id} "
+                        f"{'renewed' if ok else 'attempted but still blocked'} the curl_cffi session"
+                    )
+                except Exception as e:
+                    log_warn(f"Background session refresh failed: {e}")
+                finally:
+                    self._checkin_slot(slot)
+
+        self._refresher_thread = threading.Thread(
+            target=_loop, daemon=True, name="session-refresher"
+        )
+        self._refresher_thread.start()
+        log_info(f"Background session refresher started (~every {interval}s) — keeps curl_cffi "
+                 f"cookies warm continuously instead of only refreshing after a failure")
 
     def apply_cookies(self, http_session: cffi_requests.Session) -> None:
         with self.cookie_lock:
@@ -246,16 +404,21 @@ class _BrowserPool:
         with self.breaker_lock:
             if success:
                 self._curl_fail_streak = 0
+                self._cb_trip_count = 0  # a clean success earns back full trust
                 return
             self._curl_fail_streak += 1
-            if self._curl_fail_streak >= CIRCUIT_BREAKER_THRESHOLD and \
+            if self._curl_fail_streak >= self.cb_threshold and \
                     self._total_requests >= self._curl_disabled_until:
-                self._curl_disabled_until = self._total_requests + CIRCUIT_BREAKER_COOLDOWN
-                log_warn(f"curl_cffi has failed {self._curl_fail_streak} times in a row — "
-                         f"skipping it for the next {CIRCUIT_BREAKER_COOLDOWN} request(s) and "
-                         f"going straight to the browser pool")
+                self._cb_trip_count += 1
+                cooldown = int(self.cb_cooldown_base * (self.cb_cooldown_growth ** (self._cb_trip_count - 1)))
+                self._curl_disabled_until = self._total_requests + cooldown
+                self._curl_fail_streak = 0  # reset — don't keep counting past the threshold
+                log_warn(f"curl_cffi failed {self.cb_threshold} times in a row "
+                         f"(trip #{self._cb_trip_count}) — skipping it for the next "
+                         f"{cooldown} request(s), going straight to the browser pool")
 
     def close(self) -> None:
+        self._shutdown = True
         for slot in self.slots:
             slot.close()
 
@@ -299,9 +462,11 @@ def prime(cfg: dict) -> None:
     or ThreadPoolExecutor. signal.signal() only succeeds when called from
     the main thread, and this also warms up every pool slot up front so
     the first real requests from worker threads don't each pay the full
-    clearance cost."""
+    clearance cost, then starts the proactive background session
+    refresher."""
     pool = _BrowserPool(cfg)
     pool.warm_up()
+    pool.start_background_refresher()
 
 
 class CloudflareSession:
@@ -311,10 +476,16 @@ class CloudflareSession:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self._pool = _BrowserPool(cfg)
-        self.http = cffi_requests.Session(
-            impersonate=random.choice(IMPERSONATE_PROFILES), headers=DEFAULT_HEADERS
-        )
+        self._proxies = _proxy_dict(get_proxy_url())
+        self.http = self._new_http_session()
         self._pool.apply_cookies(self.http)
+
+    def _new_http_session(self) -> cffi_requests.Session:
+        return cffi_requests.Session(
+            impersonate=random.choice(IMPERSONATE_PROFILES),
+            headers=DEFAULT_HEADERS,
+            proxies=self._proxies,
+        )
 
     def _http_get(self, url: str, timeout: int = 30):
         return self.http.get(url, timeout=timeout, allow_redirects=True)
@@ -322,16 +493,32 @@ class CloudflareSession:
     def get_html(self, url: str, force_browser: bool = False) -> Optional[str]:
         self._pool.note_request()
         if not force_browser and self._pool.should_try_curl():
-            try:
-                resp = self._http_get(url)
-                if not looks_like_cloudflare(resp.text, resp.status_code):
-                    self._pool.note_curl_result(True)
-                    return resp.text
-                self._pool.note_curl_result(False)
-                log_warn(f"curl_cffi blocked/challenged on {url} (status={resp.status_code}) — escalating to browser pool")
-            except Exception as e:
-                self._pool.note_curl_result(False)
-                log_warn(f"curl_cffi error on {url}: {e} — escalating to browser pool")
+            attempts = max(1, self.cfg.get("curl_retry_attempts", 2))
+            for attempt in range(1, attempts + 1):
+                try:
+                    resp = self._http_get(url)
+                    if not looks_like_cloudflare(resp.text, resp.status_code):
+                        self._pool.note_curl_result(True)
+                        return resp.text
+                    if attempt < attempts:
+                        # rotate TLS impersonation profile and retry once
+                        # more before this counts as one breaker failure —
+                        # cheap (no browser) and sometimes enough on its own
+                        self.http = self._new_http_session()
+                        self._pool.apply_cookies(self.http)
+                        continue
+                    self._pool.note_curl_result(False)
+                    log_warn(f"curl_cffi blocked/challenged on {url} "
+                             f"(status={resp.status_code}) after {attempts} attempt(s) "
+                             f"— escalating to browser pool")
+                except Exception as e:
+                    if attempt < attempts:
+                        self.http = self._new_http_session()
+                        self._pool.apply_cookies(self.http)
+                        continue
+                    self._pool.note_curl_result(False)
+                    log_warn(f"curl_cffi error on {url}: {e} after {attempts} attempt(s) "
+                             f"— escalating to browser pool")
 
         html = self._pool.refresh_clearance(url)
         self._pool.apply_cookies(self.http)  # pick up fresh cookies for this thread too
