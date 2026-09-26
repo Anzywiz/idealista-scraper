@@ -68,6 +68,14 @@ WHAT CHANGED FROM v3, AND WHY:
    (a blip recovers fast), and the fail streak itself resets on trip so it
    doesn't uselessly keep counting past the threshold.
 
+7. Self-healing dead sessions. A slot's browser can die outside of our
+   control — crash, OOM, or a launch race during recycling — and without a
+   health check, every future fetch on that slot repeated the identical
+   "connect call failed" to the same dead debugger port forever, which is
+   what you just hit. Any exception during a fetch now force-closes that
+   slot's browser and retries once immediately with a freshly launched one,
+   instead of getting stuck reusing a dead session indefinitely.
+
 Strategy per request (unchanged in spirit from v3):
   1. If the circuit breaker says curl_cffi is currently worth trying, try
      it first (fast, no browser) — retrying once with a different TLS
@@ -164,8 +172,15 @@ class _BrowserSlot:
             proxy = get_proxy_url()
             if proxy:
                 sb_kwargs["proxy"] = proxy
-            self._sb_cm = SB(**sb_kwargs)
-            self._sb = self._sb_cm.__enter__()
+            try:
+                self._sb_cm = SB(**sb_kwargs)
+                self._sb = self._sb_cm.__enter__()
+            except Exception:
+                # leave clean None state so the NEXT call retries fresh
+                # instead of being stuck with a half-initialized object
+                self._sb_cm = None
+                self._sb = None
+                raise
             _LAST_LAUNCH_MONOTONIC[0] = time.monotonic()
 
             session_id = None
@@ -244,23 +259,39 @@ class _BrowserSlot:
 
         return html  # still blocked after the full budget; caller logs it
 
-    def fetch(self, url: str) -> tuple[Optional[str], list, Optional[str]]:
+    def fetch(self, url: str, _retry: bool = True) -> tuple[Optional[str], list, Optional[str]]:
         """Navigate this slot's browser to url and return (html, cookies,
         user_agent). Blocks other callers of THIS slot until done — other
-        slots are unaffected, which is what gives the pool its concurrency."""
+        slots are unaffected, which is what gives the pool its concurrency.
+
+        Self-healing: if the browser this slot is holding has died (crashed,
+        OOM'd, or was left half-broken by a launch race), the exception
+        would otherwise repeat identically forever — every future fetch on
+        this slot hitting the same now-dead debugger port. Instead, any
+        failure here forces the slot closed so the NEXT attempt is
+        guaranteed a fresh browser, and retries once immediately before
+        giving up."""
         with self.lock:
             self._maybe_recycle()
             sb = self._ensure_browser()
-            sb.activate_cdp_mode(url)
-            html = self._wait_for_clearance(sb)
-            cookies = sb.get_cookies()
-            user_agent = None
             try:
-                user_agent = sb.execute_script("return navigator.userAgent")
-            except Exception:
-                pass
-            self._fetch_count += 1
-            return html, cookies, user_agent
+                sb.activate_cdp_mode(url)
+                html = self._wait_for_clearance(sb)
+                cookies = sb.get_cookies()
+                user_agent = None
+                try:
+                    user_agent = sb.execute_script("return navigator.userAgent")
+                except Exception:
+                    pass
+                self._fetch_count += 1
+                return html, cookies, user_agent
+            except Exception as e:
+                log_warn(f"Slot #{self.slot_id} browser session appears dead ({e}) — "
+                         f"closing it so the next attempt launches a fresh one")
+                self._close_locked()
+                if _retry:
+                    return self.fetch(url, _retry=False)
+                raise
 
     def close(self) -> None:
         with self.lock:
